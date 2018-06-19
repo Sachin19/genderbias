@@ -2,6 +2,7 @@
 from tensorflow.core.example import example_pb2
 import numpy as np
 import tensorflow as tf
+import threading
 
 import glob
 import random
@@ -110,13 +111,14 @@ def example_generator(data_path, single_pass):
   epoch = 0
   while True:
     filelist = glob.glob(data_path) # get the list of datafiles
-    print "filelist",filelist
+    # print "filelist",filelist
     assert filelist, ('Error: Empty filelist at %s' % data_path) # check filelist isn't empty
     if single_pass:
       filelist = sorted(filelist)
     else:
       random.shuffle(filelist)
     for f in filelist:
+      # print "YESSSSSSSSSSSSSSSSSSSS",threading.current_thread().ident,f
       reader = open(f, 'rb')
       while True:
         len_bytes = reader.read(8)

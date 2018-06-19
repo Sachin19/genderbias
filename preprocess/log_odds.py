@@ -14,7 +14,6 @@ import argparse
 #1371056 the
 #923839 and
 #765263 i
-
 parser = argparse.ArgumentParser(description='Computes the weighted log-odds-ratio, informative dirichlet prior algorithm')
 parser.add_argument('-f','--first', help='Description for first counts file ', default='greatreviews.out')
 parser.add_argument('-s','--second', help='Description for second counts file', default='badreviews.out')

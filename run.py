@@ -1,7 +1,9 @@
 from collections import namedtuple
 from data import Vocab
 from model import ClassificationModel
+from batcher import Batcher
 from tensorflow.python import debug as tf_debug
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 import tensorflow as tf
 import numpy as np
@@ -15,6 +17,7 @@ FLAGS = tf.app.flags.FLAGS
 
 # Where to find data
 tf.app.flags.DEFINE_string('data_path', '', 'Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
+tf.app.flags.DEFINE_string('eval_data_path', '', 'Path expression to tf.Example datafiles. Can include wildcards to access multiple datafiles.')
 tf.app.flags.DEFINE_string('vocab_path', '', 'Path expression to text vocabulary file.')
 
 # Important settings
@@ -91,39 +94,43 @@ def setup_training(model, batcher, vocab, hps):
   if not os.path.exists(train_dir): os.makedirs(train_dir)
 
   model.build_graph() # build the graph
-  # tf.logging.info("Total number of trainable parameters: "+str(np.sum([np.prod(v.get_shape().as_list()) for v in tf.trainable_variables()])))
+  tf.logging.info("Total number of trainable parameters: "+str(np.sum([np.prod(v.get_shape().as_list()) for v in tf.trainable_variables()])))
 
-  # if FLAGS.restore_best_model:
-  #   restore_best_model()
-  # saver = tf.train.Saver(max_to_keep=3) # keep 3 checkpoints at a time
-  # eval_saver = tf.train.Saver(max_to_keep=5)
+  if FLAGS.restore_best_model:
+    restore_best_model()
+  saver = tf.train.Saver(max_to_keep=3) # keep 3 checkpoints at a time
+  eval_saver = tf.train.Saver(max_to_keep=5)
 
-  # sv = tf.train.Supervisor(logdir=train_dir,
-  #                    is_chief=True,
-  #                    saver=saver,
-  #                    summary_op=None,
-  #                    save_summaries_secs=60, # save summaries for tensorboard every 60 secs
-  #                    save_model_secs=60, # checkpoint every 60 secs
-  #                    global_step=model.global_step)
-  # summary_writer = sv.summary_writer
-  # tf.logging.info("Preparing or waiting for session...")
-  # sess_context_manager = sv.prepare_or_wait_for_session(config=util.get_config())
-  # tf.logging.info("Created session.")
-  # try:
-  #   run_training(model, batcher, sess_context_manager, sv, summary_writer, source_vocab, target_vocab, hps, eval_saver) # this is an infinite loop until interrupted
-  # except KeyboardInterrupt:
-  #   tf.logging.info("Caught keyboard interrupt on worker. Stopping supervisor...")
-  #   sv.stop()
+  sv = tf.train.Supervisor(logdir=train_dir,
+                     is_chief=True,
+                     saver=saver,
+                     summary_op=None,
+                     save_summaries_secs=60, # save summaries for tensorboard every 60 secs
+                     save_model_secs=60, # checkpoint every 60 secs
+                     global_step=model.global_step)
+  summary_writer = sv.summary_writer
+  tf.logging.info("Preparing or waiting for session...")
+  sess_context_manager = sv.prepare_or_wait_for_session(config=util.get_config())
+  tf.logging.info("Created session.")
+  try:
+    run_training(model, batcher, sess_context_manager, sv, summary_writer, vocab, hps, eval_saver) # this is an infinite loop until interrupted
+  except KeyboardInterrupt:
+    tf.logging.info("Caught keyboard interrupt on worker. Stopping supervisor...")
+    sv.stop()
 
 
-def get_eval_loss(sess, model, source_vocab, target_vocab, hps, data_path):
+def get_eval_loss(sess, model, vocab, hps, data_path):
 
-  eval_batcher = Batcher(data_path, source_vocab, target_vocab, hps, True)
+  eval_batcher = Batcher(data_path, vocab, hps, True)
   total_loss = 0.0
-  total_other_loss=0.0
-  total_predict_steps = 0
-  total_norm = 0.0
+  total_ce_loss = 0.0
+  total_correct_preds = 0.0
+  preds = []
+  truey = []
   n=0
+
+  if FLAGS.mode == 'decode':
+    pass
 
   while True:
     try:
@@ -132,36 +139,39 @@ def get_eval_loss(sess, model, source_vocab, target_vocab, hps, data_path):
         break
       eval_results = model.run_eval_step(sess, eval_batch)
 
-      predict_steps = eval_results['predict_steps']
       batch_size = FLAGS.batch_size
       loss = eval_results['loss']
-      other_loss = eval_results['other_loss']
-      norm = eval_results['norm']
-      
+      ce_loss = eval_results['ce_loss']
+      correct_predictions = eval_results['correct_predictions']
+      predictions = eval_results['predictions']
+      true_labels = eval_batch.labels
+      preds += list(predictions)
+      truey += list(true_labels)
+
       total_loss += loss*batch_size
-      total_other_loss += other_loss*batch_size
-      total_norm += norm*batch_size
+      total_ce_loss += ce_loss*batch_size
+      total_correct_preds += correct_predictions
       n+=batch_size
-      total_predict_steps += predict_steps
     except StopIteration:
       break
 
   eval_loss = total_loss/n
-  per_step_other = total_other_loss/total_predict_steps
-  per_step_loss = total_loss/total_predict_steps
-  per_step_norm = total_norm/total_predict_steps
+  eval_ce_loss = total_ce_loss/n
+  accuracy = total_correct_preds/n
 
+  print " Precision Score:", precision_score(truey, preds),
+  print " Recall Score:", recall_score(truey, preds),
+  print " F1 Score:", f1_score(truey, preds)
   print n
-  print total_predict_steps
 
-  return eval_loss, per_step_other, per_step_loss, per_step_norm
+  return eval_loss, eval_ce_loss, accuracy
 
-def run_training(model, batcher, sess_context_manager, sv, summary_writer, source_vocab, target_vocab, hps, eval_saver):
+def run_training(model, batcher, sess_context_manager, sv, summary_writer, vocab, hps, eval_saver):
   """Repeatedly runs training iterations, logging loss to screen and writing summaries"""
   eval_dir = os.path.join(FLAGS.log_root, "eval") # make a subdir of the root dir for eval data
   bestmodel_save_path = os.path.join(eval_dir, 'bestmodel') # this is where checkpoints of best models are saved
   # eval_saver = tf.train.Saver(max_to_keep=5)
-  best_loss = FLAGS.best_loss
+  best_loss = None
   prev_loss = None
   tf.logging.info("starting run_training")
 
@@ -184,45 +194,44 @@ def run_training(model, batcher, sess_context_manager, sv, summary_writer, sourc
 
         if train_step >= FLAGS.total_steps:
           tf.logging.info("Training is complete. Go home")
-          break 
+          break
 
-      if train_step % 500 == 0:
-        eval_loss, per_step_other, per_step_loss, per_step_norm = get_eval_loss(sess, model, source_vocab, target_vocab, hps, FLAGS.eval_data_path)
+      if train_step % 500 == 0 and train_step > 0:
+        eval_loss, eval_ce_loss, accuracy = get_eval_loss(sess, model, vocab, hps, FLAGS.eval_data_path)
 
-        if best_loss is None or per_step_loss < best_loss:
+        if best_loss is None or accuracy > best_loss:
           tf.logging.info('Found new best model. Saving to %s', bestmodel_save_path)
           x = eval_saver.save(sess, bestmodel_save_path, global_step=train_step, latest_filename='checkpoint_best')
           tf.logging.info("X="+str(x))
-          best_loss = per_step_loss
+          best_loss = accuracy
           counts_till_no_increase = 0
         else:
-          counts_till_no_increase += 1 
+          counts_till_no_increase += 1
 
         if prev_loss is not None and FLAGS.optimizer == 'sgd':
           if prev_loss < eval_loss:
             sgd_lr *= FLAGS.decay_coefficient
         prev_loss = eval_loss
 
-        tf.logging.info(str(train_step)+' completed, eval loss='+str(eval_loss)+", loss_per_step = "+str(per_step_loss)+", other_loss_per_step = "+str(per_step_other)+", norm = "+str(per_step_norm)+", time perstep="+str(tt/1000))
+        tf.logging.info(str(train_step)+' completed, eval loss='+str(eval_loss)+' eval ce_loss='+str(eval_ce_loss)+", accuracy = "+str(accuracy)+", time perstep="+str(tt/1000))
         tt=0.0
 
-        if counts_till_no_increase > 80:
-          tf.logging.info("Evaluation Loss has not improved since 40,000 steps. Terminating training!")
-          break
+        # if counts_till_no_increase > 80:
+        #   tf.logging.info("Evaluation Loss has not improved since 40,000 steps. Terminating training!")
+        #   break
 
       # tf.logging.info('running training step '+str(train_step)+', learning rate='+str(sgd_lr)+'...')
       batch = batcher.next_batch()
       t0=time.time()
-      results = model.run_train_step(sess, batch, sgd_lr, alpha)
-      alpha = 1-alpha
+      results = model.run_train_step(sess, batch, sgd_lr)
       t1=time.time()
       tt += (t1-t0)
       # tf.logging.info('seconds for training step: %.3f', t1-t0)
 
       loss = results['loss']
-      other_loss = results['other_loss']
-      if train_step % 1000 == 0:
-        tf.logging.info('Training loss for this batch: %f, %f', loss, other_loss) # print the loss to screen
+      accuracy = results['accuracy']
+      if train_step % 100 == 0:
+        tf.logging.info('Training loss and accuracy for this batch: %f, %f', loss, accuracy) # print the loss to screen
 
       if not np.isfinite(loss):
         raise Exception("Loss is not finite. Stopping.")
@@ -235,7 +244,7 @@ def run_training(model, batcher, sess_context_manager, sv, summary_writer, sourc
         summary_writer.flush()
 
 
-def run_eval(model, source_vocab, target_vocab, hps):
+def run_eval(model, vocab, hps):
   """Repeatedly runs eval iterations, logging to screen and writing summaries. Saves the model with the best loss seen so far."""
   model.build_graph() # build the graph
   saver = tf.train.Saver(max_to_keep=3) # we will keep 3 best checkpoints at a time
@@ -247,8 +256,88 @@ def run_eval(model, source_vocab, target_vocab, hps):
   best_loss = None  # will hold the best loss achieved so far
 
   _ = util.load_ckpt(saver, sess) # load a new checkpoint
-  eval_loss, per_step_other, per_step_loss, per_step_norm = get_eval_loss(sess, model, source_vocab, target_vocab, hps, FLAGS.data_path)
-  tf.logging.info('eval loss='+str(eval_loss)+", loss_per_step = "+str(per_step_loss)+", other_loss_per_step = "+str(per_step_other)+", norm = "+str(per_step_norm))
+  eval_loss, eval_ce_loss, accuracy = get_eval_loss(sess, model, vocab, hps, FLAGS.data_path)
+  tf.logging.info('eval loss='+str(eval_loss)+', eval ce_loss='+str(eval_ce_loss)+", accuracy = "+str(accuracy))
+
+def get_decode_results(sess, model, vocab, hps, data_path):
+
+  eval_batcher = Batcher(data_path, vocab, hps, True)
+  total_loss = 0.0
+  total_correct_preds = 0.0
+  predictions = np.array([])
+  original_comments = []
+  gold_labels = []
+  attention_scores = []
+  labelvalues = np.array(["male", "female"])
+  predicted_labels = []
+  probabilities = np.array([])
+
+  n=0
+
+  while True:
+    try:
+      eval_batch = eval_batcher.next_batch()
+      if eval_batch is None:
+        break
+      eval_results = model.run_eval_step(sess, eval_batch)
+      batch = eval_batch
+      batch_size = FLAGS.batch_size
+      loss = eval_results['loss']
+      correct_predictions = eval_results['correct_predictions']
+      predictions = eval_results['predictions']
+      predicted_labels = np.concatenate((predicted_labels, labelvalues[predictions]))
+      # print eval_results['probs']
+      # print eval_results['batch']
+      # print batch.enc_batch[0]
+      # print batch.enc_batch[1]
+      # print batch.enc_batch[2]
+      # raw_input()
+      probabilities = np.concatenate((probabilities, eval_results['probs']))
+      gold_labels += batch.original_labels
+      original_comments += batch.original_comments
+      attention_scores += list(eval_results['attention_scores'])
+
+      total_loss += loss*batch_size
+      total_correct_preds += correct_predictions
+      n+=batch_size
+    except StopIteration:
+      break
+
+  eval_loss = total_loss/n
+  accuracy = total_correct_preds/n
+
+  return eval_loss, accuracy, original_comments, gold_labels, predicted_labels, attention_scores, np.array(probabilities, dtype=str)
+
+def run_decode(model, vocab, hps):
+  """Repeatedly runs eval iterations, logging to screen and writing summaries. Saves the model with the best loss seen so far."""
+  model.build_graph() # build the graph
+  saver = tf.train.Saver(max_to_keep=3) # we will keep 3 best checkpoints at a time
+  sess = tf.Session(config=util.get_config())
+  eval_dir = os.path.join(FLAGS.log_root, "eval") # make a subdir of the root dir for eval data
+  bestmodel_save_path = os.path.join(eval_dir, 'bestmodel') # this is where checkpoints of best models are saved
+  summary_writer = tf.summary.FileWriter(eval_dir)
+  running_avg_loss = 0 # the eval job keeps a smoother, running average loss to tell it when to implement early stopping
+  best_loss = None  # will hold the best loss achieved so far
+
+  _ = util.load_ckpt(saver, sess) # load a new checkpoint
+  eval_loss, accuracy, original_comments, gold_labels, predicted_labels, attention_scores, probabilities = get_decode_results(sess, model, vocab, hps, FLAGS.data_path)
+  decode_dir = os.path.join(FLAGS.log_root, "decode")
+  if not os.path.exists(decode_dir): os.mkdir(decode_dir)
+
+  outputfile = open(os.path.join(decode_dir, "outputs"), "w")
+  attentionfile = open(os.path.join(decode_dir, "attention_scores"), "w")
+  for comment, gl, pl, prob in zip(original_comments, gold_labels, predicted_labels, probabilities):
+    outputfile.write("\t".join([comment, str(gl), str(pl), str(prob)]))
+    outputfile.write("\n")
+
+  for attention_score in attention_scores:
+    attentionfile.write(" ".join(np.array(attention_score, dtype=str)))
+    attentionfile.write("\n")
+
+  outputfile.close()
+  attentionfile.close()
+
+  tf.logging.info('eval loss='+str(eval_loss)+", accuracy = "+str(accuracy))
 
 def main(unused_argv):
   if len(unused_argv) != 1: # prints a message if you've entered flags incorrectly
@@ -276,25 +365,29 @@ def main(unused_argv):
   hps = namedtuple("HParams", hps_dict.keys())(**hps_dict)
 
   # Create a batcher object that will create minibatches of data
-  # batcher = Batcher(FLAGS.data_path, source_vocab, target_vocab, hps, single_pass=FLAGS.single_pass)
 
   tf.set_random_seed(1233) # a seed value for randomness
 
   if hps.mode == 'train':
     print "creating model..."
+    batcher = Batcher(FLAGS.data_path, vocab, hps, single_pass=False)
     model = ClassificationModel(hps, vocab)
-    batcher = None
+    # batcher = None
     setup_training(model, batcher, vocab, hps)
 
   elif hps.mode == 'eval':
   	model = ClassificationModel(hps, vocab)
   	run_eval(model, vocab, hps)
 
+  elif hps.mode == 'decode':
+    model = ClassificationModel(hps, vocab)
+    run_decode(model, vocab, hps)
+
   # elif hps.mode == 'decode':
   #   decode_model_hps = hps  # This will be the hyperparameters for the decoder model
   #   decode_model_hps = hps._replace(max_dec_steps=1) # The model is configured with max_dec_steps=1 because we only ever run one step of the decoder at a time (to do beam search). Note that the batcher is initialized with max_dec_steps equal to e.g. 100 because the batches need to contain the full summaries
-    
-  
+
+
   else:
     raise ValueError("The 'mode' flag must be one of train/eval/decode")
 

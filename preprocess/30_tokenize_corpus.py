@@ -27,11 +27,16 @@ UNK_PLACEHOLDER = "UNK"
 REPLACE_LIST = {
   "he": "THEY",
   "she": "THEY",
+  "she's": "THEY'RE",
+  "he's": "THEY'RE",
   "his": "THEIR",
   "her": "THEIR",
+  "hers": "THEIR'S",
   "him": "THEIR",  
   "himself": "SELF",
   "herself": "SELF",
+  "man": "PERSON",
+  "woman": "PERSON",
   "congressman": "CONGRESSPERSON",
   "congresswoman": "CONGRESSPERSON",
   "mr": "ADDRESS",
@@ -130,20 +135,23 @@ def ProcessReplaceList(tokens):
 def main():
   for line_num, line in enumerate(args.infile):
     tokens = unicodedata.normalize('NFKD', line.decode('utf8')).encode('ascii','ignore').strip().split('\t')
-    if len(tokens) < 2:
-      print("Skipping line:", line)
-      continue
-    to_tokenize = tokens[1]
+    # if len(tokens) < 2:
+    #   print("Skipping line:", line)
+    #   continue
+    to_tokenize = tokens[0]
     filtered1 = ReplaceNumbers(ReplaceEmoticons(ReplaceUserName(ReplaceURLs(to_tokenize))))
     tokenized_sentences = []
     for sent in nltk.sent_tokenize(filtered1):
       sent_tokenized = TOKENIZER.tokenize(sent)
-      filtered2 = ProcessReplaceList(LowerCase(sent_tokenized))
+      filtered2 = ProcessReplaceList(LowerCase(sent_tokenized))#RemoveNamedEntities(sent_tokenized)))
       tokenized_sentences.append(" ".join(filtered2))
-    # tokenized = " ".join(tokenized_sentences)
-    for sent in tokenized_sentences:
-      args.outfile.write("\t".join([tokens[0], sent.encode("utf8")] + tokens[2:]))
-      args.outfile.write("\n")
+    tokenized = " ".join(tokenized_sentences)
+    # args.outfile.write("\t".join([tokens[0], tokenized.encode("utf8")] + tokens[2:]))
+    args.outfile.write(tokenized.encode("utf8"))
+    args.outfile.write("\n")
+    # for sent in tokenized_sentences:
+    #   args.outfile.write("\t".join([tokens[0], sent.encode("utf8")] + tokens[2:]))
+    #   args.outfile.write("\n")
   
 if __name__ == '__main__':
   main()

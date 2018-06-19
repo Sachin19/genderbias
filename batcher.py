@@ -13,28 +13,34 @@ FLAGS = tf.app.flags.FLAGS
 class Example(object):
   """Class representing a train/val/test example for text summarization."""
 
-  def __init__(self, comment, label, vocab, hps):
+  def __init__(self, comment, label, keywords, topics, vocab, hps):
     """Initializes the Example, performing tokenization and truncation to produce the encoder, decoder and target sequences, which are stored in self.
 
     Args:
-      article: source text; a string. each token is separated by a single space.
-      abstract_sentences: list of strings, one per abstract sentence. In each sentence, each token is separated by a single space.
+      comment: source text; a string. each token is separated by a single space.
+      label: male or female
       vocab: Vocabulary object
       hps: hyperparameters
     """
     self.hps = hps
 
-    # Process the article
-    comment_words = comment.split()
+    # Process the comment
+    comment_words = comment.strip().split()
     if len(comment_words) > hps.max_enc_steps:
       comment_words = comment_words[:hps.max_enc_steps]
     self.enc_len = len(comment_words) # store the length after truncation but before padding
     self.enc_input = [vocab.word2id(w) for w in comment_words] # list of word ids; OOVs are represented by the id for UNK token
 
-    label_id = int(label == "female")
-    
-    self.original_comment = comment
+    self.label_id = int(label == "female")
+    if keywords:
+      self.keywords = [int(k) for k in keywords.split()]
+    if topics:
+      self.topics = [float(t) for t in topics.split()]
+
+    self.original_comment = comment.strip()
     self.original_label = label
+    self.original_keywords = keywords
+    self.original_topics = topics
 
   def pad_encoder_input(self, max_len, pad_id):
     """Pad the encoder input sequence with pad_id up to max_len."""
@@ -54,6 +60,7 @@ class Batch(object):
     """
     self.pad_id = vocab.word2id(data.PAD_TOKEN) # id of the PAD token used to pad sequences
     self.init_encoder_seq(example_list, hps) # initialize the input to the encoder
+    self.init_labels(example_list, hps)
     self.store_orig_strings(example_list) # store the original strings
 
   def init_encoder_seq(self, example_list, hps):
@@ -94,10 +101,32 @@ class Batch(object):
       for j in xrange(ex.enc_len):
         self.enc_padding_mask[i][j] = 1
 
+  def init_labels(self, example_list, hps):
+    self.labels = np.zeros((hps.batch_size,), dtype=np.int32)
+    k=False
+    t=False
+    self.keywords = np.zeros((hps.batch_size, 346), dtype=np.int32)
+    self.topics = np.zeros((hps.batch_size, 50), dtype=np.float32)
+    if example_list[0].original_keywords:
+      k=True
+    if example_list[0].original_topics:
+      t=True
+
+    for i, ex in enumerate(example_list):
+      self.labels[i] = ex.label_id
+      if k:
+        self.keywords[i, :] = ex.keywords[:]
+      if t:
+        self.topics[i,:] = ex.topics[:]
+
+
   def store_orig_strings(self, example_list):
     """Store the original article and abstract strings in the Batch object"""
     self.original_comments = [ex.original_comment for ex in example_list] # list of lists
-    self.original_labels = [ex.original_label for ex in example_list] # list of lists
+    self.original_labels = [ex.original_label for ex in example_list] # list of strings
+    self.original_keywords = [ex.original_keywords for ex in example_list] # list of lists
+    self.original_topics = [ex.original_topics for ex in example_list] # list of lists
+
 
 
 class Batcher(object):
@@ -119,6 +148,7 @@ class Batcher(object):
     self._vocab = vocab
     self._hps = hps
     self._single_pass = single_pass
+    self._total_batches_so_far = 0
 
     # Initialize a queue of Batches waiting to be used, and a queue of Examples waiting to be batched
     self._batch_queue = Queue.Queue(self.BATCH_QUEUE_MAX)
@@ -131,8 +161,8 @@ class Batcher(object):
       self._bucketing_cache_size = 1 # only load one batch's worth of examples before bucketing; this essentially means no bucketing
       self._finished_reading = False # this will tell us when we're finished reading the dataset
     else:
-      self._num_example_q_threads = 16 # num threads to fill example queue
-      self._num_batch_q_threads = 4  # num threads to fill batch queue
+      self._num_example_q_threads = 1 # num threads to fill example queue
+      self._num_batch_q_threads = 1 # num threads to fill batch queue
       self._bucketing_cache_size = 100 # how many batches-worth of examples to load into cache before bucketing
 
     # Start the threads that load the queues
@@ -170,17 +200,18 @@ class Batcher(object):
         return None
 
     batch = self._batch_queue.get() # get the next Batch
+    self._total_batches_so_far += 1
     return batch
 
   def fill_example_queue(self):
     """Reads data from file and processes into Examples which are then placed into the example queue."""
-
+    print self._single_pass
     input_gen = self.text_generator(data.example_generator(self._data_path, self._single_pass))
 
     while True:
       try:
-        (comment, label) = input_gen.next() # read the next example from file. article and abstract are both strings.
-      
+        (comment, label, keywords, topics) = input_gen.next() # read the next example from file. article and abstract are both strings.
+
       except StopIteration: # if there are no more examples:
         tf.logging.info("The example generator for this example queue filling thread has exhausted data.")
         if self._single_pass:
@@ -190,7 +221,7 @@ class Batcher(object):
         else:
           raise Exception("single_pass mode is off but the example generator is out of data; error.")
 
-      example = Example(comment, label, self._vocab, self._hps) # Process into an Example.
+      example = Example(comment, label, keywords, topics, self._vocab, self._hps) # Process into an Example.
       self._example_queue.put(example) # place the Example in the example queue.
 
 
@@ -200,26 +231,26 @@ class Batcher(object):
     In decode mode, makes batches that each contain a single example repeated.
     """
     while True:
-      if self._hps.mode != 'decode':
+      #if self._hps.mode != 'decode':
         # Get bucketing_cache_size-many batches of Examples into a list, then sort
-        inputs = []
-        for _ in xrange(self._hps.batch_size * self._bucketing_cache_size):
-          inputs.append(self._example_queue.get())
-        inputs = sorted(inputs, key=lambda inp: inp.enc_len) # sort by length of encoder sequence
+      inputs = []
+      for _ in xrange(self._hps.batch_size * self._bucketing_cache_size):
+        inputs.append(self._example_queue.get())
+      inputs = sorted(inputs, key=lambda inp: inp.enc_len) # sort by length of encoder sequence
 
-        # Group the sorted Examples into batches, optionally shuffle the batches, and place in the batch queue.
-        batches = []
-        for i in xrange(0, len(inputs), self._hps.batch_size):
-          batches.append(inputs[i:i + self._hps.batch_size])
-        if not self._single_pass:
-          shuffle(batches)
-        for b in batches:  # each b is a list of Example objects
-          self._batch_queue.put(Batch(b, self._hps, self._vocab))
-
-      else: # beam search decode mode
-        ex = self._example_queue.get()
-        b = [ex for _ in xrange(self._hps.batch_size)]
+      # Group the sorted Examples into batches, optionally shuffle the batches, and place in the batch queue.
+      batches = []
+      for i in xrange(0, len(inputs), self._hps.batch_size):
+        batches.append(inputs[i:i + self._hps.batch_size])
+      if not self._single_pass:
+        shuffle(batches)
+      for b in batches:  # each b is a list of Example objects
         self._batch_queue.put(Batch(b, self._hps, self._vocab))
+
+      # else: # beam search decode mode
+      #   ex = self._example_queue.get()
+      #   b = [ex for _ in xrange(self._hps.batch_size)]
+      #   self._batch_queue.put(Batch(b, self._hps, self._vocab))
 
 
   def watch_threads(self):
@@ -252,10 +283,18 @@ class Batcher(object):
       try:
         comment_text = e.features.feature['comment'].bytes_list.value[0] # the article text was saved under the key 'article' in the data files
         label_text = e.features.feature['label'].bytes_list.value[0] # the abstract text was saved under the key 'abstract' in the data files
+        if 'keywords' in e.features.feature:
+          keywords = e.features.feature['keywords'].bytes_list.value[0]
+        else:
+          keywords = None
+        if 'topics' in e.features.feature:
+          topics = e.features.feature['topics'].bytes_list.value[0]
+        else:
+          topics = None
       except ValueError:
         tf.logging.error('Failed to get comment or label from example')
         continue
-      if len(article_text)==0: # See https://github.com/abisee/pointer-generator/issues/1
+      if len(comment_text)==0: # See https://github.com/abisee/pointer-generator/issues/1
         tf.logging.warning('Found an example with empty comment. Skipping it.')
       else:
-        yield (comment_text, label_text)
+        yield (comment_text, label_text, keywords, topics)
